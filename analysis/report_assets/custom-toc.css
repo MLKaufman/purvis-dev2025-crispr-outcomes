@@ -1,0 +1,41 @@
+/* Custom TOC width adjustments for Quarto */
+
+/* Target the main TOC container */
+.sidebar-navigation,
+.sidebar nav[role="doc-toc"],
+.toc-active,
+nav[role="doc-toc"] {
+    width: 400px !important;
+    max-width: 400px !important;
+    min-width: 400px !important;
+}
+
+/* Target the TOC content area */
+.sidebar-navigation .sidebar-item,
+.sidebar nav[role="doc-toc"] .nav,
+nav[role="doc-toc"] .nav {
+    width: 100% !important;
+}
+
+/* Ensure TOC text doesn't wrap unnecessarily */
+.sidebar nav[role="doc-toc"] .nav-link,
+nav[role="doc-toc"] .nav-link {
+    white-space: nowrap !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+    padding-right: 10px !important;
+}
+
+/* Adjust the overall grid layout */
+.quarto-layout-panel .quarto-layout-row {
+    grid-template-columns: 1fr 400px !important;
+}
+
+/* For larger screens, ensure proper spacing */
+@media (min-width: 1200px) {
+    .sidebar-navigation,
+    .sidebar nav[role="doc-toc"],
+    nav[role="doc-toc"] {
+        width: 400px !important;
+    }
+}

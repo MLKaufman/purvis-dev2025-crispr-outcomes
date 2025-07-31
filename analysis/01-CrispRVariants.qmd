@@ -1,0 +1,384 @@
+---
+title: "Analysis: CrispRVariants"
+subtitle: "Brzezinski - Purvis Dev paper CRISPR editing outcomes"
+author: 
+  name: "Michael Kaufman, PhD"
+  orcid: 0000-0003-2441-5836
+  email: michael.kaufman@cuanschutz.edu
+  affiliation: 
+    name: "University of Colorado Cancer Center"
+    url: "https://medschool.cuanschutz.edu/colorado-cancer-center"
+abstract:
+  ""
+
+editor: source
+theme: cosmo
+number-sections: true
+link-citations: true
+link-external-references: true
+
+format:
+  html:
+    title-block-banner: "report_assets/analysis-logo.png"
+    embed-resources: true
+    self_contained: true
+    highlight-style: pygments
+    code-fold: true
+    code-summary: "[code]"
+    code-overflow: wrap
+    toc: true
+    toc-depth: 2
+    toc-location: right  
+    css: report_assets/custom-toc.css
+    grid:
+      sidebar-width: 300px
+      body-width: 1600px
+      margin-width: 300px
+      gutter-width: 10px
+
+execute:
+  warning: false
+  message: false
+  fig.align: "center"
+
+params:
+  outs_path: "outs"
+  data_path: "../raw_data"
+  processed_data_path: "../processed_data"
+  ref_genome: "../ref/mm39.fa"
+  gtf_file: "../ref/gencode.vM37.basic.annotation.gtf"
+  sample_metadata_file: "../sample_metadata.csv"
+  target_chr: "chr14"
+  target_start: 48978776
+  target_end: 48978843
+  target_strand: "*"
+  bwa_threads: 6
+  target_loc_forward: 50
+  target_loc_reverse: 50
+
+---
+
+## Notes
+
+This document is part of the Purvis Dev 2025 CRISPR editing outcomes analysis. It uses the `CrispRVariants` package to analyze CRISPR editing outcomes from paired-end sequencing data. Amplicon sequencing data is used to assess the efficiency of CRISPR editing at a specific target region in the mouse genome.
+
+The following external tools are used in this analysis and must be installed and available in your PATH:
+`bwa mem` is used for alignment, and `CrispRVariants` is used to analyze the editing outcomes.
+`samtools` is used for BAM file processing.
+
+This experiment uses paired-end sequencing data, where each sample has two FASTQ files (R1 and R2). The analysis will align these reads to a reference genome, create a `CrispRVariants` object, and visualize the editing outcomes.
+
+## Environment
+
+```{r setup, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, fig.align='center')
+
+# Start timing the document render
+start_time <- Sys.time()
+```
+
+### Load libraries
+
+```{r load libraries}
+
+library(CrispRVariants)
+library(Rsamtools)
+library(GenomicRanges)
+library(GenomicFeatures)
+library(Biostrings)
+library(DT)
+library(gridExtra)
+
+source("scripts/qmd_embed_download.R")
+source("scripts/renv_embed_download.R")
+
+set.seed(87645893)
+
+dir.create(params$outs_path, showWarnings = TRUE)
+```
+
+## Sample metadata
+
+```{r samples}
+# Load the sample metadata
+sample_metadata <- read.csv(file.path(params$sample_metadata_file), header = TRUE)
+
+datatable(sample_metadata)
+```
+
+## CrispR editing outcomes analysis
+
+### Alignment - Paired-end sample processing
+
+```{r alignment}
+bwa_ref <- params$ref_genome
+raw_data_dir <- params$data_path
+bam_dir <- params$processed_data_path
+
+# Get all fastq files in the raw data directory
+fq_fnames <- list.files(raw_data_dir, pattern = "fastq.gz$", full.names = TRUE)
+
+# For paired-end reads, group files by sample name (handling _R1_001/_R2_001 naming)
+# Extract sample names by removing _R1_001/_R2_001 suffixes
+sample_names <- unique(gsub("_R[12]_001", "", basename(fq_fnames)))
+sample_names <- gsub("\\.fastq\\.gz$", "", sample_names)
+
+bam_dir_full <- file.path(bam_dir)
+dir.create(bam_dir_full, showWarnings = FALSE, recursive = TRUE)
+
+# Process each sample
+for(sample in sample_names) {
+  # Find R1 and R2 files for this sample
+  r1_file <- fq_fnames[grepl(paste0(sample, "_R1_001"), basename(fq_fnames))]
+  r2_file <- fq_fnames[grepl(paste0(sample, "_R2_001"), basename(fq_fnames))]
+  
+  # Check if we have both R1 and R2
+  if(length(r1_file) == 1 && length(r2_file) == 1) {
+    # Define file names explicitly
+    unsorted_bam <- file.path(bam_dir_full, paste0(sample, "_unsorted.bam"))
+    sorted_bam <- file.path(bam_dir_full, paste0(sample, "_sorted.bam"))
+    
+    # Skip if already processed
+    if(!file.exists(paste0(sorted_bam, ".bai"))) {
+      cmd <- paste0("bwa mem -t ", params$bwa_threads, " ", bwa_ref, " ", r1_file, " ", r2_file,
+                    " | samtools view -Sb - > ", unsorted_bam)
+      message("Processing paired-end sample: ", sample)
+      message(cmd, "\n")
+      system(cmd)
+      
+      # Sort and index - FIX: Remove .bam extension for sortBam()
+      message("Sorting and indexing: ", basename(sorted_bam))
+      sorted_bam_base <- tools::file_path_sans_ext(sorted_bam)  # Remove .bam extension
+      sortBam(unsorted_bam, sorted_bam_base)  # sortBam will add .bam automatically
+      indexBam(sorted_bam)  # Index the final .bam file
+      unlink(unsorted_bam)  # Remove unsorted BAM
+      
+      message("Created: ", sorted_bam)
+    } else {
+      message("Already processed: ", sample)
+    }
+    
+  } else {
+    warning("Could not find proper R1/R2 files for sample: ", sample)
+    message("R1 file found: ", length(r1_file), " - ", ifelse(length(r1_file) > 0, r1_file, "none"))
+    message("R2 file found: ", length(r2_file), " - ", ifelse(length(r2_file) > 0, r2_file, "none"))
+  }
+}
+
+# Get list of sorted BAM files for downstream analysis
+sorted_bam_files <- list.files(bam_dir_full, pattern = "_sorted\\.bam$", full.names = TRUE)
+message("Found ", length(sorted_bam_files), " sorted BAM files:")
+for(bam_file in sorted_bam_files) {
+  message("  - ", bam_file)
+  message("    Index exists: ", file.exists(paste0(bam_file, ".bai")))
+}
+```
+
+### Create the target location and reference sequence
+
+```{r target-location}
+# Define the target location and reference sequence as granges
+target_location <- GRanges(
+  seqnames = params$target_chr,
+  ranges = IRanges(start = params$target_start, end = params$target_end),
+  strand = params$target_strand
+)
+
+# Extract reference sequence
+reference_raw <- system(sprintf("samtools faidx %s %s:%s-%s",
+                               params$ref_genome,
+                               seqnames(target_location)[1], 
+                               start(target_location)[1], 
+                               end(target_location)[1]),
+                       intern = TRUE)[[2]]
+
+# Convert to DNAString and reverse complement
+reference <- Biostrings::reverseComplement(Biostrings::DNAString(reference_raw))
+
+# Check lengths match
+target_width <- width(target_location)
+ref_length <- nchar(reference_raw)
+
+message("Target width: ", target_width)
+message("Reference length: ", ref_length)
+message("Reference sequence: ", reference_raw)
+
+# If they don't match, adjust the target to match the reference
+if(target_width != ref_length) {
+  message("Adjusting target location to match reference sequence length")
+  target_location <- GRanges(
+    seqnames = params$target_chr,
+    ranges = IRanges(start = params$target_start, end = params$target_start + ref_length - 1),
+    strand = params$target_strand
+  )
+  message("New target width: ", width(target_location))
+}
+```
+
+### CrisprSet object
+
+This object is created from the sorted BAM files and the target location. It will contain the read counts and variant information for each sample at the specified target region.
+
+```{r crispr-set}
+# Grab sorted bams from processed_data using the exact same pattern
+sorted_bam_files <- list.files(params$processed_data_path, pattern = "_sorted\\.bam$", full.names = TRUE)
+
+if(length(sorted_bam_files) == 0) {
+  stop("No sorted BAM files found in ", params$processed_data_path, ". Check alignment step.")
+}
+
+message("BAM files found for CrisprSet:")
+for(bam_file in sorted_bam_files) {
+  message("  - ", basename(bam_file))
+}
+
+bam_sample_names <- gsub("_sorted\\.bam$", "", basename(sorted_bam_files))
+message("Sample names: ", paste(bam_sample_names, collapse = ", "))
+
+# Check all files exist and are indexed
+for(bam_file in sorted_bam_files) {
+  if(!file.exists(bam_file)) {
+    stop("BAM file not found: ", bam_file)
+  }
+  if(!file.exists(paste0(bam_file, ".bai"))) {
+    message("Indexing missing for: ", basename(bam_file))
+    indexBam(bam_file)
+  }
+}
+
+crispr_set <- readsToTarget(sorted_bam_files, 
+                           target = target_location, 
+                           reference = reference,
+                           names = bam_sample_names, 
+                           target.loc = params$target_loc_forward)
+
+DT::datatable(variantCounts(crispr_set))
+DT::datatable(as.data.frame(consensusSeqs(crispr_set)))
+```
+
+### Variant plots
+
+This section creates variant plots for the CRISPR editing outcomes. It uses the `CrispRVariants` package to visualize the variants detected in the target region across samples.
+
+```{r variant-plots}
+gtf_fname <- params$gtf_file
+
+# Check if GTF file exists
+if(file.exists(gtf_fname)) {
+  message("Creating TxDb from GTF file...")
+  txdb <- GenomicFeatures::makeTxDbFromGFF(gtf_fname, format = "gtf")
+  
+  # Check if there are any genes in our target region
+  target_genes <- genes(txdb, filter = list(tx_chrom = seqnames(target_location)[1]))
+  overlapping_genes <- subsetByOverlaps(target_genes, target_location)
+  
+  if(length(overlapping_genes) == 0) {
+    message("No genes found overlapping target region. Proceeding without gene annotation.")
+    txdb <- NULL
+  } else {
+    message("Found ", length(overlapping_genes), " genes overlapping target region")
+    print(overlapping_genes)
+  }
+} else {
+  message("GTF file not found at: ", gtf_fname)
+  message("Proceeding without gene annotation")
+  txdb <- NULL
+}
+```
+
+```{r variant-plots2}
+#| fig.width: 16
+#| fig.height: 16
+
+group <- sample_metadata$treatment
+
+plotVariants(crispr_set, txdb = txdb, gene.text.size = 8, 
+    row.ht.ratio = c(1,8), col.wdth.ratio = c(4,2),
+    plotAlignments.args = list(line.weight = 0.5, ins.size = 2, 
+                               legend.symbol.size = 4),
+    plotFreqHeatmap.args = list(plot.text.size = 3, x.size = 8, group = group, 
+                                legend.text.size = 8, 
+                                legend.key.height = grid::unit(0.5, "lines"))) 
+
+pdf("variant_plot.pdf", width = 8, height = 6)
+plotVariants(crispr_set)
+dev.off()
+```
+
+### Mutation efficiency
+
+```{r mutation-efficiency}
+eff <- mutationEfficiency(crispr_set, filter.cols = "ControlDHS15primers", exclude.cols = "ControlDHS15primers")
+eff
+```
+
+```{r crispr-set-reverse}
+#| fig.width: 16
+#| fig.height: 16
+crispr_set_rev <-  readsToTarget(sorted_bam_files, target = target_location, reference = reference,
+                            names = bam_sample_names, target.loc = params$target_loc_reverse, 
+                                orientation = "opposite")
+plotVariants(crispr_set_rev)
+```
+
+### Calculate frequency of each variant and total variants
+
+```{r variant-frequency}
+#| eval: false
+
+# Calculate frequency of each variant
+variant_freq <- variantFrequency(crispr_set, filter.cols = "ControlDHS15primers", exclude.cols = "ControlDHS15primers")
+datatable(variant_freq)
+
+```
+
+## Reproducibility
+
+### Code document - `quarto`
+
+The code in quarto document format is included below which can be used to render and rerun this analysis workflow in its entirety. It can be rendered with the `quarto` publishing system running in the R programming environment in the `renv` section. You can download the file using the button below.
+
+```{r qmd-download}
+#| echo: false
+#| results: "asis"
+
+qmd_embed_download()
+
+```
+
+### R programming environment - `renv`
+
+This project uses `renv` to manage package dependencies. `renv` is an R package that helps create and manage project-specific environments, ensuring that the correct versions of packages are used for reproducibility. To restore the environment, you would typically run `renv::restore()` in your R session, which will install the packages specified in the `renv.lock` file.
+You can download the `renv.lock` file below to restore the environment.
+
+```{r renv-download}
+#| echo: false
+#| results: "asis"
+
+renv_embed_download()
+
+```
+
+The current status of the environment is as follows:
+
+```{r, renv-status}
+renv::status()
+```
+
+## Session info
+
+```{r session-info}
+sessionInfo()
+```
+
+---
+
+```{r render-time}
+#| echo: false
+#| results: "asis"
+end_time <- Sys.time()
+render_duration <- end_time - start_time
+
+cat("Document render completed at:", format(end_time, "%Y-%m-%d %H:%M:%S"), "\n\n")
+cat("Total render time:", round(as.numeric(render_duration, units = "mins"), 2), "minutes\n")
+```
