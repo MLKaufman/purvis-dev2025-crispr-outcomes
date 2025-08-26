@@ -38,12 +38,24 @@ CRISPR editing will result in a higher frequency of indels at the target region 
 
 **guide RNA sequences used for CRISPR editing:**
   
-DHS15- g1 = GCTGCCCCAGCCTTTCACAA
+DHS15 - g1 = GCTGCCCCAGCCTTTCACAA
 DHS15 - g2 = TTTTCTTTTTTATTTAACCG
 DHS2 - g1 = CACCGACCCAGCTCTGGCAGATGGG
 DHS2 - g2 = ATTTTGAACCCCCTACAGAT
 
 These sequences do not include the PAM sequence.
+
+**amplicon information:**
+
+For DHS15:
+Amplicon size = 437 bp
+Forward primer = GGTGTGCACCTCACCCGTGTTT
+Reverse primer = CACATCAAGCTGGAGGGCTGCA
+
+For DHS2:
+Amplicon size = 638 bp
+Forward primer = CCGAAGTGCCAGGAGGAAAGGC
+Reverse primer = ACCAAACCACACCACACCACACC
 
 ### Raw Data
 

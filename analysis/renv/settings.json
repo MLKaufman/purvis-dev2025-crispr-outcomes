@@ -17,3 +17,14 @@
   "vcs.ignore.local": true,
   "vcs.manage.ignores": true
 }
+
+    {
+        "key": "Ctrl+Shift+P",
+        "command": "workbench.action.executeCode.console",
+        "when": "editorTextFocus && (editorLangId == 'rmarkdown' || editorLangId == 'quarto')",
+        "args": {
+            "langId": "r",
+            "code": "params <- rmarkdown::yaml_front_matter(rstudioapi::getSourceEditorContext()$path)$params |> lapply(\\(x) if (is.list(x)) x$value else x)",
+            "focus": true
+        }
+    }

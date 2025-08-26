@@ -1,0 +1,6 @@
+3a50808761f5c81538c01f7aa6851cc1  ./ControlDHS15primers_R1_001.fastq.gz
+ac0383fd178158ef558252afbe9d7506  ./ControlDHS2primers_R1_001.fastq.gz
+2a04a874fb5fcc1047c64e4ac15b033f  ./TestDHS15primers_R1_001.fastq.gz
+ab9cd27dbf1f212492fb43080c3ec250  ./TestDHS15primers_R2_001.fastq.gz
+aba6c455d2e6208b084e666cbce52fdf  ./ControlDHS2primers_R2_001.fastq.gz
+4ed366dd3338d78bf7df455e5d90b811  ./ControlDHS15primers_R2_001.fastq.gz

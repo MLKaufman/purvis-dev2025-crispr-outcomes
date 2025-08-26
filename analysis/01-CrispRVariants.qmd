@@ -42,20 +42,18 @@ execute:
   fig.align: "center"
 
 params:
-  outs_path: "outs"
-  data_path: "../raw_data"
-  processed_data_path: "../processed_data"
+  bwa_threads: 6
+  outs_path: "outs/01-CrispRVariants"
+  fastq_path: "../raw_data/fastq"
+  bam_path: "../processed_data"
   ref_genome: "../ref/mm39.fa"
   gtf_file: "../ref/gencode.vM37.basic.annotation.gtf"
-  sample_metadata_file: "../sample_metadata.csv"
+  treatment: "TestDHS15primers_R2"
+  control: "ControlDHS15primers_R2"
+  guide_name: "DHS15g2" # DHS15g1 or DHS15g2
+  guide_sequence: "TTTTCTTTTTTATTTAACCG" # GCTGCCCCAGCCTTTCACAA or TTTTCTTTTTTATTTAACCG
   target_chr: "chr14"
-  target_start: 48978776
-  target_end: 48978843
-  target_strand: "*"
-  bwa_threads: 6
-  target_loc_forward: 50
-  target_loc_reverse: 50
-
+  target_padding: 30
 ---
 
 ## Notes
@@ -88,6 +86,7 @@ library(GenomicFeatures)
 library(Biostrings)
 library(DT)
 library(gridExtra)
+library(Gviz)
 
 source("scripts/qmd_embed_download.R")
 source("scripts/renv_embed_download.R")
@@ -97,122 +96,244 @@ set.seed(87645893)
 dir.create(params$outs_path, showWarnings = TRUE)
 ```
 
-## Sample metadata
+## Analysis parameters
 
 ```{r samples}
-# Load the sample metadata
-sample_metadata <- read.csv(file.path(params$sample_metadata_file), header = TRUE)
+datatable(t(as.data.frame(params)), 
+          options = list(dom = 't', paging = FALSE))
+```
 
-datatable(sample_metadata)
+## Alignment of FASTQ files
+
+This step calls the BWA and SAMtools commands to align the FASTQ files to the reference genome and create sorted BAM files.
+
+```{r align-fastq}
+dir.create(params$bam_path, recursive = TRUE, showWarnings = FALSE)
+
+fastqs <- list.files(params$fastq_path, pattern="\\.(fastq|fq)(\\.gz)?$", full.names=TRUE, ignore.case=TRUE)
+stopifnot(length(fastqs) > 0)
+
+for (fq in fastqs) {
+  sample <- sub("\\.(fastq|fq)(\\.gz)?$", "", basename(fq), ignore.case=TRUE)
+  bam <- file.path(params$bam_path, paste0(sample, "_sorted.bam"))
+
+  if (!file.exists(bam)) {
+    message("Aligning: ", sample)
+    cmd <- sprintf('bwa mem -t %d "%s" "%s" | samtools sort -@ %d -o "%s"',
+                   as.integer(params$bwa_threads), params$ref_genome, fq,
+                   as.integer(params$bwa_threads), bam)
+    status <- system(cmd)
+    if (status != 0) stop("Alignment failed for: ", sample)
+    system2("samtools", c("index", "-@", as.character(params$bwa_threads), bam))
+  } else {
+    message("Skipping ", sample, " — BAM already exists.")
+  }
+}
 ```
 
 ## CrispR editing outcomes analysis
 
-### Alignment - Paired-end sample processing
+### Create the target location and reference sequence
 
-```{r alignment}
-bwa_ref <- params$ref_genome
-raw_data_dir <- params$data_path
-bam_dir <- params$processed_data_path
-
-# Get all fastq files in the raw data directory
-fq_fnames <- list.files(raw_data_dir, pattern = "fastq.gz$", full.names = TRUE)
-
-# For paired-end reads, group files by sample name (handling _R1_001/_R2_001 naming)
-# Extract sample names by removing _R1_001/_R2_001 suffixes
-sample_names <- unique(gsub("_R[12]_001", "", basename(fq_fnames)))
-sample_names <- gsub("\\.fastq\\.gz$", "", sample_names)
-
-bam_dir_full <- file.path(bam_dir)
-dir.create(bam_dir_full, showWarnings = FALSE, recursive = TRUE)
-
-# Process each sample
-for(sample in sample_names) {
-  # Find R1 and R2 files for this sample
-  r1_file <- fq_fnames[grepl(paste0(sample, "_R1_001"), basename(fq_fnames))]
-  r2_file <- fq_fnames[grepl(paste0(sample, "_R2_001"), basename(fq_fnames))]
+```{r auto-detect-target}
+# Auto-detect target region based on guide sequence
+detect_target_from_guide <- function(ref_genome, guide_seq, target_chr = NULL, flank_size = 50) {
   
-  # Check if we have both R1 and R2
-  if(length(r1_file) == 1 && length(r2_file) == 1) {
-    # Define file names explicitly
-    unsorted_bam <- file.path(bam_dir_full, paste0(sample, "_unsorted.bam"))
-    sorted_bam <- file.path(bam_dir_full, paste0(sample, "_sorted.bam"))
+  message("Searching for guide sequence: ", guide_seq)
+  
+  # If chromosome is specified, search only that chromosome
+  if(!is.null(target_chr)) {
+    search_cmd <- sprintf("samtools faidx %s %s | grep -v '^>' | tr -d '\\n' | grep -o -b '%s\\|%s'",
+                         ref_genome, target_chr, guide_seq, 
+                         as.character(reverseComplement(DNAString(guide_seq))))
+    chromosomes_to_search <- target_chr
+  } else {
+    # Search all chromosomes - get chromosome list first
+    chr_cmd <- sprintf("samtools faidx %s.fai | cut -f1", ref_genome)
+    chromosomes_to_search <- system(chr_cmd, intern = TRUE)
+    chromosomes_to_search <- chromosomes_to_search[grepl("^chr", chromosomes_to_search)]
+  }
+  
+  target_locations <- list()
+  
+  for(chr in chromosomes_to_search) {
+    message("Searching chromosome: ", chr)
     
-    # Skip if already processed
-    if(!file.exists(paste0(sorted_bam, ".bai"))) {
-      cmd <- paste0("bwa mem -t ", params$bwa_threads, " ", bwa_ref, " ", r1_file, " ", r2_file,
-                    " | samtools view -Sb - > ", unsorted_bam)
-      message("Processing paired-end sample: ", sample)
-      message(cmd, "\n")
-      system(cmd)
-      
-      # Sort and index - FIX: Remove .bam extension for sortBam()
-      message("Sorting and indexing: ", basename(sorted_bam))
-      sorted_bam_base <- tools::file_path_sans_ext(sorted_bam)  # Remove .bam extension
-      sortBam(unsorted_bam, sorted_bam_base)  # sortBam will add .bam automatically
-      indexBam(sorted_bam)  # Index the final .bam file
-      unlink(unsorted_bam)  # Remove unsorted BAM
-      
-      message("Created: ", sorted_bam)
-    } else {
-      message("Already processed: ", sample)
+    # Extract chromosome sequence
+    chr_seq_cmd <- sprintf("samtools faidx %s %s", ref_genome, chr)
+    chr_lines <- system(chr_seq_cmd, intern = TRUE)
+    
+    if(length(chr_lines) < 2) next
+    
+    chr_seq <- paste(chr_lines[-1], collapse = "")
+    chr_dna <- DNAString(chr_seq)
+    
+    # Search for guide sequence on forward strand
+    forward_matches <- matchPattern(guide_seq, chr_dna)
+    if(length(forward_matches) > 0) {
+      for(i in seq_along(forward_matches)) {
+        match_start <- start(forward_matches)[i]
+        match_end <- end(forward_matches)[i]
+        
+        # Calculate cut site (typically 3bp upstream of PAM, which is ~17bp into guide)
+        cut_site <- match_start + 17
+        
+        target_locations[[length(target_locations) + 1]] <- list(
+          chr = chr,
+          guide_start = match_start,
+          guide_end = match_end,
+          cut_site = cut_site,
+          strand = "+",
+          target_start = max(1, cut_site - flank_size),
+          target_end = cut_site + flank_size,
+          target_loc_forward = flank_size + 1, # Relative to target_start
+          target_loc_reverse = flank_size + 1
+        )
+      }
     }
     
-  } else {
-    warning("Could not find proper R1/R2 files for sample: ", sample)
-    message("R1 file found: ", length(r1_file), " - ", ifelse(length(r1_file) > 0, r1_file, "none"))
-    message("R2 file found: ", length(r2_file), " - ", ifelse(length(r2_file) > 0, r2_file, "none"))
+    # Search for guide sequence on reverse strand
+    reverse_matches <- matchPattern(reverseComplement(DNAString(guide_seq)), chr_dna)
+    if(length(reverse_matches) > 0) {
+      for(i in seq_along(reverse_matches)) {
+        match_start <- start(reverse_matches)[i]
+        match_end <- end(reverse_matches)[i]
+        
+        # For reverse strand, cut site is typically 3bp downstream
+        cut_site <- match_end - 17
+        
+        target_locations[[length(target_locations) + 1]] <- list(
+          chr = chr,
+          guide_start = match_start,
+          guide_end = match_end,
+          cut_site = cut_site,
+          strand = "-",
+          target_start = max(1, cut_site - flank_size),
+          target_end = cut_site + flank_size,
+          target_loc_forward = flank_size + 1,
+          target_loc_reverse = flank_size + 1
+        )
+      }
+    }
   }
+  
+  return(target_locations)
 }
 
-# Get list of sorted BAM files for downstream analysis
-sorted_bam_files <- list.files(bam_dir_full, pattern = "_sorted\\.bam$", full.names = TRUE)
-message("Found ", length(sorted_bam_files), " sorted BAM files:")
-for(bam_file in sorted_bam_files) {
-  message("  - ", bam_file)
-  message("    Index exists: ", file.exists(paste0(bam_file, ".bai")))
+# Auto-detect target region
+detected_targets <- detect_target_from_guide(
+  ref_genome = params$ref_genome,
+  guide_seq = params$guide_sequence,
+  target_chr = params$target_chr,  # Use specified chromosome if available
+  flank_size = params$target_padding  # 30bp flanking regions
+)
+
+message("Found ", length(detected_targets), " potential target sites")
+
+if(length(detected_targets) == 0) {
+  stop("Guide sequence not found in reference genome!")
 }
+
+# Display detected targets
+detected_df <- do.call(rbind, lapply(detected_targets, function(x) {
+  data.frame(
+    Chromosome = x$chr,
+    Guide_Start = x$guide_start,
+    Guide_End = x$guide_end,
+    Cut_Site = x$cut_site,
+    Strand = x$strand,
+    Target_Start = x$target_start,
+    Target_End = x$target_end,
+    stringsAsFactors = FALSE
+  )
+}))
+
+DT::datatable(detected_df, caption = "Detected Target Locations for Guide Sequence")
+
+# Use the first detected target (or filter by chromosome if specified)
+if(!is.null(params$target_chr)) {
+  # Filter to specified chromosome
+  chr_matches <- detected_targets[sapply(detected_targets, function(x) x$chr == params$target_chr)]
+  if(length(chr_matches) > 0) {
+    selected_target <- chr_matches[[1]]
+  } else {
+    stop("No targets found on specified chromosome: ", params$target_chr)
+  }
+} else {
+  selected_target <- detected_targets[[1]]
+}
+
+message("Selected target:")
+message("  Chromosome: ", selected_target$chr)
+message("  Target region: ", selected_target$target_start, "-", selected_target$target_end)
+message("  Strand: ", selected_target$strand)
+message("  Cut site: ", selected_target$cut_site)
+
+# Override parameters with detected values
+auto_params <- list(
+  target_chr = selected_target$chr,
+  target_start = selected_target$target_start,
+  target_end = selected_target$target_end,
+  target_strand = selected_target$strand,
+  target_loc_forward = selected_target$target_loc_forward,
+  target_loc_reverse = selected_target$target_loc_reverse
+)
 ```
-
-### Create the target location and reference sequence
 
 ```{r target-location}
 # Define the target location and reference sequence as granges
 target_location <- GRanges(
   seqnames = params$target_chr,
-  ranges = IRanges(start = params$target_start, end = params$target_end),
-  strand = params$target_strand
+  ranges = IRanges(start = auto_params$target_start, end = auto_params$target_end),
+  strand = auto_params$target_strand
 )
 
 # Extract reference sequence
-reference_raw <- system(sprintf("samtools faidx %s %s:%s-%s",
-                               params$ref_genome,
-                               seqnames(target_location)[1], 
-                               start(target_location)[1], 
-                               end(target_location)[1]),
-                       intern = TRUE)[[2]]
+ref_cmd <- sprintf("samtools faidx %s %s:%s-%s",
+                  params$ref_genome,
+                  seqnames(target_location)[1],
+                  start(target_location)[1],
+                  end(target_location)[1])
 
-# Convert to DNAString and reverse complement
-reference <- Biostrings::reverseComplement(Biostrings::DNAString(reference_raw))
+ref_lines <- system(ref_cmd, intern = TRUE)
 
-# Check lengths match
-target_width <- width(target_location)
-ref_length <- nchar(reference_raw)
-
-message("Target width: ", target_width)
-message("Reference length: ", ref_length)
-message("Reference sequence: ", reference_raw)
-
-# If they don't match, adjust the target to match the reference
-if(target_width != ref_length) {
-  message("Adjusting target location to match reference sequence length")
-  target_location <- GRanges(
-    seqnames = params$target_chr,
-    ranges = IRanges(start = params$target_start, end = params$target_start + ref_length - 1),
-    strand = params$target_strand
-  )
-  message("New target width: ", width(target_location))
+if(length(ref_lines) < 2) {
+  stop("Failed to extract reference sequence")
 }
+
+reference_raw <- paste(ref_lines[-1], collapse = "")
+
+# Use reference as-is (don't automatically reverse complement)
+reference <- Biostrings::DNAString(reference_raw)
+
+# Validate guide sequence is found in reference
+guide_found_forward <- grepl(params$guide_sequence, reference_raw, fixed = TRUE)
+guide_found_reverse <- grepl(as.character(Biostrings::reverseComplement(Biostrings::DNAString(params$guide_sequence))), 
+                            reference_raw, fixed = TRUE)
+
+if(guide_found_forward) {
+  message("Guide sequence found on forward strand in target region")
+} else if(guide_found_reverse) {
+  message("Guide sequence found on reverse strand in target region")
+} else {
+  warning("Guide sequence not found in target region - check detection results")
+}
+
+message("Target width: ", width(target_location))
+message("Reference length: ", nchar(reference_raw))
+message("Guide sequence: ", params$guide_sequence)
+message("Reference sequence: ", substr(reference_raw, 1, 50), "...")
+
+# Show final parameters being used
+final_params_df <- data.frame(
+  Parameter = c("target_chr", "target_start", "target_end", "target_strand", 
+               "target_loc_forward", "target_loc_reverse"),
+  Value = c(auto_params$target_chr, auto_params$target_start, auto_params$target_end, 
+           auto_params$target_strand, auto_params$target_loc_forward, auto_params$target_loc_reverse),
+  stringsAsFactors = FALSE
+)
+
+DT::datatable(final_params_df, caption = "Final Target Parameters")
 ```
 
 ### CrisprSet object
@@ -220,23 +341,41 @@ if(target_width != ref_length) {
 This object is created from the sorted BAM files and the target location. It will contain the read counts and variant information for each sample at the specified target region.
 
 ```{r crispr-set}
-# Grab sorted bams from processed_data using the exact same pattern
-sorted_bam_files <- list.files(params$processed_data_path, pattern = "_sorted\\.bam$", full.names = TRUE)
+# Get all sorted BAM files first
+all_bam_files <- list.files(params$bam_path, pattern = "_sorted\\.bam$", full.names = TRUE)
 
-if(length(sorted_bam_files) == 0) {
-  stop("No sorted BAM files found in ", params$processed_data_path, ". Check alignment step.")
+if(length(all_bam_files) == 0) {
+  stop("No sorted BAM files found in ", params$bam_path, ". Check alignment step.")
 }
 
-message("BAM files found for CrisprSet:")
-for(bam_file in sorted_bam_files) {
-  message("  - ", basename(bam_file))
+all_sample_names <- gsub("_sorted\\.bam$", "", basename(all_bam_files))
+
+# Filter to only treatment and control samples based on parameters
+treatment_indices <- which(grepl(params$treatment, all_sample_names))
+control_indices <- which(grepl(params$control, all_sample_names))
+
+# Combine indices and get corresponding BAM files
+selected_indices <- c(treatment_indices, control_indices)
+selected_bam_files <- all_bam_files[selected_indices]
+selected_sample_names <- all_sample_names[selected_indices]
+
+message("All BAM files found: ", length(all_bam_files))
+message("Treatment pattern '", params$treatment, "' matches: ", length(treatment_indices), " files")
+message("Control pattern '", params$control, "' matches: ", length(control_indices), " files")
+message("Selected BAM files for analysis: ", length(selected_bam_files))
+
+if(length(selected_bam_files) == 0) {
+  stop("No BAM files match the treatment (", params$treatment, ") or control (", params$control, ") patterns!")
 }
 
-bam_sample_names <- gsub("_sorted\\.bam$", "", basename(sorted_bam_files))
-message("Sample names: ", paste(bam_sample_names, collapse = ", "))
+message("Selected BAM files:")
+for(i in seq_along(selected_bam_files)) {
+  sample_type <- if(i <= length(treatment_indices)) "TREATMENT" else "CONTROL"
+  message("  - ", basename(selected_bam_files[i]), " (", sample_type, ")")
+}
 
-# Check all files exist and are indexed
-for(bam_file in sorted_bam_files) {
+# Check selected files exist and are indexed
+for(bam_file in selected_bam_files) {
   if(!file.exists(bam_file)) {
     stop("BAM file not found: ", bam_file)
   }
@@ -246,14 +385,18 @@ for(bam_file in sorted_bam_files) {
   }
 }
 
-crispr_set <- readsToTarget(sorted_bam_files, 
+# Use ONLY the selected BAM files for CrisprSet creation
+crispr_set <- readsToTarget(selected_bam_files, 
                            target = target_location, 
                            reference = reference,
-                           names = bam_sample_names, 
-                           target.loc = params$target_loc_forward)
+                           names = selected_sample_names, 
+                           target.loc = auto_params$target_loc_forward)
 
 DT::datatable(variantCounts(crispr_set))
-DT::datatable(as.data.frame(consensusSeqs(crispr_set)))
+
+# Update the global variables to use selected samples
+sorted_bam_files <- selected_bam_files
+bam_sample_names <- selected_sample_names
 ```
 
 ### Variant plots
@@ -289,10 +432,29 @@ if(file.exists(gtf_fname)) {
 ```{r variant-plots2}
 #| fig.width: 16
 #| fig.height: 16
+#| results: "hide"
+#| message: false
+#| warning: false
 
-group <- sample_metadata$treatment
+# Now group will only include the selected samples
+group <- ifelse(grepl(params$treatment, bam_sample_names), "treatment", 
+                ifelse(grepl(params$control, bam_sample_names), "control", "other"))
 
-plotVariants(crispr_set, txdb = txdb, gene.text.size = 8, 
+# Validation - should now only show selected samples
+message("Sample groupings (selected samples only):")
+message("Treatment (", params$treatment, "): ", paste(bam_sample_names[group == "treatment"], collapse = ", "))
+message("Control (", params$control, "): ", paste(bam_sample_names[group == "control"], collapse = ", "))
+message("Other: ", paste(bam_sample_names[group == "other"], collapse = ", "))
+
+# Verify we have both groups
+if(!any(group == "treatment")) {
+  warning("No treatment samples found in selected BAMs!")
+}
+if(!any(group == "control")) {
+  warning("No control samples found in selected BAMs!")
+}
+
+plotVariants(crispr_set, txdb = txdb, gene.text.size = 8, main = paste0(params$treatment, " vs ", params$control),
     row.ht.ratio = c(1,8), col.wdth.ratio = c(4,2),
     plotAlignments.args = list(line.weight = 0.5, ins.size = 2, 
                                legend.symbol.size = 4),
@@ -300,36 +462,94 @@ plotVariants(crispr_set, txdb = txdb, gene.text.size = 8,
                                 legend.text.size = 8, 
                                 legend.key.height = grid::unit(0.5, "lines"))) 
 
-pdf("variant_plot.pdf", width = 8, height = 6)
-plotVariants(crispr_set)
+# Use parameter-based filename
+pdf(file.path(params$outs_path, paste0(params$treatment, "_vs_", params$control, "_variant_plot.pdf")), 
+    width = 16, height = 16)
+plotVariants(crispr_set, main = paste0(params$treatment, " vs ", params$control))
 dev.off()
 ```
 
-### Mutation efficiency
-
 ```{r mutation-efficiency}
-eff <- mutationEfficiency(crispr_set, filter.cols = "ControlDHS15primers", exclude.cols = "ControlDHS15primers")
-eff
-```
+# Calculate mutation efficiency
+control_pattern <- params$control
+treatment_pattern <- params$treatment
 
-```{r crispr-set-reverse}
-#| fig.width: 16
-#| fig.height: 16
-crispr_set_rev <-  readsToTarget(sorted_bam_files, target = target_location, reference = reference,
-                            names = bam_sample_names, target.loc = params$target_loc_reverse, 
-                                orientation = "opposite")
-plotVariants(crispr_set_rev)
-```
+# Dynamic sample identification using the parameters
+treatment_samples <- bam_sample_names[grepl(treatment_pattern, bam_sample_names)]
+control_samples <- bam_sample_names[grepl(control_pattern, bam_sample_names)]
 
-### Calculate frequency of each variant and total variants
+message("Treatment samples: ", paste(treatment_samples, collapse = ", "))
+message("Control samples: ", paste(control_samples, collapse = ", "))
+
+if(length(treatment_samples) > 0 && length(control_samples) > 0) {
+  tryCatch({
+    eff <- mutationEfficiency(crispr_set, 
+                             filter.cols = control_pattern, 
+                             exclude.cols = control_pattern)
+    message("Mutation efficiency: ", round(eff, 4))
+    
+    # Create summary table
+    efficiency_summary <- data.frame(
+      Metric = "Mutation Efficiency",
+      Value = round(eff, 4),
+      Treatment_Pattern = treatment_pattern,
+      Control_Pattern = control_pattern,
+      Treatment_Samples = length(treatment_samples),
+      Control_Samples = length(control_samples),
+      stringsAsFactors = FALSE
+    )
+    
+    DT::datatable(efficiency_summary, caption = "CRISPR Editing Efficiency")
+    
+    # Save results
+    write.csv(efficiency_summary, 
+             file.path(params$outs_path, paste0(treatment_pattern, "_vs_", control_pattern, "_efficiency.csv")),
+             row.names = FALSE)
+    
+  }, error = function(e) {
+    message("Error calculating mutation efficiency: ", e$message)
+  })
+} else {
+  message("Cannot calculate mutation efficiency - missing treatment or control samples")
+}
+```
 
 ```{r variant-frequency}
-#| eval: false
+# Calculate and display variant frequencies
+if(length(control_samples) > 0) {
+  tryCatch({
+    variant_freq <- variantFrequency(crispr_set, 
+                                   filter.cols = params$control, 
+                                   exclude.cols = params$control)
+    
+    DT::datatable(variant_freq, 
+                 caption = paste("Variant frequencies relative to", params$control),
+                 options = list(pageLength = 15, scrollX = TRUE))
+    
+    # Save variant frequencies
+    write.csv(variant_freq, 
+             file.path(params$outs_path, paste0(params$treatment, "_vs_", params$control, "_variant_frequencies.csv")),
+             row.names = TRUE)
+    
+  }, error = function(e) {
+    message("Error calculating variant frequency: ", e$message)
+  })
+}
+```
 
-# Calculate frequency of each variant
-variant_freq <- variantFrequency(crispr_set, filter.cols = "ControlDHS15primers", exclude.cols = "ControlDHS15primers")
-datatable(variant_freq)
+### Consensus sequences
 
+```{r consensus-sequences}
+# Display consensus sequences
+consensus_seqs <- consensusSeqs(crispr_set)
+DT::datatable(as.data.frame(consensus_seqs), 
+             caption = "Consensus Sequences by Sample",
+             options = list(scrollX = TRUE))
+
+# Save consensus sequences
+write.csv(as.data.frame(consensus_seqs), 
+         file.path(params$outs_path, paste0(params$treatment, "_vs_", params$control, "_consensus_sequences.csv")),
+         row.names = TRUE)
 ```
 
 ## Reproducibility
@@ -365,7 +585,7 @@ The current status of the environment is as follows:
 renv::status()
 ```
 
-## Session info
+### Session info
 
 ```{r session-info}
 sessionInfo()

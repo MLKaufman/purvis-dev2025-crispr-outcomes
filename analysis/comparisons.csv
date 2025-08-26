@@ -1,0 +1,3 @@
+﻿treatment,control,target_chr,guide
+TestDHS15primers_R1,ControlDHS15primers_R1,chr14,GCTGCCCCAGCCTTTCACAA
+TestDHS15primers_R2,ControlDHS15primers_R2,chr14,TTTTCTTTTTTATTTAACCG
