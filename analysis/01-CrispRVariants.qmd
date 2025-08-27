@@ -99,8 +99,8 @@ dir.create(params$outs_path, showWarnings = TRUE)
 ## Analysis parameters
 
 ```{r samples}
-datatable(t(as.data.frame(params)), 
-          options = list(dom = 't', paging = FALSE))
+#datatable(t(as.data.frame(params)), 
+#          options = list(paging = FALSE))
 ```
 
 ## Alignment of FASTQ files
@@ -141,17 +141,12 @@ detect_target_from_guide <- function(ref_genome, guide_seq, target_chr = NULL, f
   
   message("Searching for guide sequence: ", guide_seq)
   
-  # If chromosome is specified, search only that chromosome
-  if(!is.null(target_chr)) {
-    search_cmd <- sprintf("samtools faidx %s %s | grep -v '^>' | tr -d '\\n' | grep -o -b '%s\\|%s'",
-                         ref_genome, target_chr, guide_seq, 
-                         as.character(reverseComplement(DNAString(guide_seq))))
-    chromosomes_to_search <- target_chr
+  chromosomes_to_search <- if(!is.null(target_chr)) {
+    target_chr
   } else {
-    # Search all chromosomes - get chromosome list first
     chr_cmd <- sprintf("samtools faidx %s.fai | cut -f1", ref_genome)
-    chromosomes_to_search <- system(chr_cmd, intern = TRUE)
-    chromosomes_to_search <- chromosomes_to_search[grepl("^chr", chromosomes_to_search)]
+    chrs <- system(chr_cmd, intern = TRUE)
+    chrs[grepl("^chr", chrs)]
   }
   
   target_locations <- list()
@@ -175,8 +170,9 @@ detect_target_from_guide <- function(ref_genome, guide_seq, target_chr = NULL, f
         match_start <- start(forward_matches)[i]
         match_end <- end(forward_matches)[i]
         
-        # Calculate cut site (typically 3bp upstream of PAM, which is ~17bp into guide)
-        cut_site <- match_start + 17
+        # For forward strand: cut site is typically 3bp upstream of PAM
+        # Assuming PAM is immediately after guide (position 21-23 of guide+PAM)
+        cut_site <- match_end - 3  # 3bp upstream of PAM (which would be after guide)
         
         target_locations[[length(target_locations) + 1]] <- list(
           chr = chr,
@@ -186,8 +182,8 @@ detect_target_from_guide <- function(ref_genome, guide_seq, target_chr = NULL, f
           strand = "+",
           target_start = max(1, cut_site - flank_size),
           target_end = cut_site + flank_size,
-          target_loc_forward = flank_size + 1, # Relative to target_start
-          target_loc_reverse = flank_size + 1
+          target_loc_forward = cut_site - max(1, cut_site - flank_size) + 1,
+          target_loc_reverse = cut_site - max(1, cut_site - flank_size) + 1
         )
       }
     }
@@ -199,8 +195,9 @@ detect_target_from_guide <- function(ref_genome, guide_seq, target_chr = NULL, f
         match_start <- start(reverse_matches)[i]
         match_end <- end(reverse_matches)[i]
         
-        # For reverse strand, cut site is typically 3bp downstream
-        cut_site <- match_end - 17
+        # For reverse strand: cut site is 3bp downstream of PAM
+        # The guide we found is the reverse complement, so cut site is near the start
+        cut_site <- match_start + 3
         
         target_locations[[length(target_locations) + 1]] <- list(
           chr = chr,
@@ -210,8 +207,8 @@ detect_target_from_guide <- function(ref_genome, guide_seq, target_chr = NULL, f
           strand = "-",
           target_start = max(1, cut_site - flank_size),
           target_end = cut_site + flank_size,
-          target_loc_forward = flank_size + 1,
-          target_loc_reverse = flank_size + 1
+          target_loc_forward = cut_site - max(1, cut_site - flank_size) + 1,
+          target_loc_reverse = cut_site - max(1, cut_site - flank_size) + 1
         )
       }
     }
@@ -283,7 +280,7 @@ auto_params <- list(
 ```{r target-location}
 # Define the target location and reference sequence as granges
 target_location <- GRanges(
-  seqnames = params$target_chr,
+  seqnames = auto_params$target_chr,
   ranges = IRanges(start = auto_params$target_start, end = auto_params$target_end),
   strand = auto_params$target_strand
 )
@@ -303,26 +300,39 @@ if(length(ref_lines) < 2) {
 
 reference_raw <- paste(ref_lines[-1], collapse = "")
 
-# Use reference as-is (don't automatically reverse complement)
-reference <- Biostrings::DNAString(reference_raw)
-
-# Validate guide sequence is found in reference
-guide_found_forward <- grepl(params$guide_sequence, reference_raw, fixed = TRUE)
-guide_found_reverse <- grepl(as.character(Biostrings::reverseComplement(Biostrings::DNAString(params$guide_sequence))), 
-                            reference_raw, fixed = TRUE)
-
-if(guide_found_forward) {
-  message("Guide sequence found on forward strand in target region")
-} else if(guide_found_reverse) {
-  message("Guide sequence found on reverse strand in target region")
+# Use the detected strand to orient the reference sequence correctly
+if(auto_params$target_strand == "-") {
+  reference <- Biostrings::reverseComplement(Biostrings::DNAString(reference_raw))
+  message("Using reverse complement for minus strand target")
+  message("Original sequence: ", substr(reference_raw, 1, 50), "...")
+  message("Rev comp sequence: ", substr(as.character(reference), 1, 50), "...")
 } else {
-  warning("Guide sequence not found in target region - check detection results")
+  reference <- Biostrings::DNAString(reference_raw)
+  message("Using forward strand reference sequence")
 }
 
+# Validate guide sequence is found in the oriented reference
+guide_found_in_reference <- grepl(params$guide_sequence, as.character(reference), fixed = TRUE)
+
+if(guide_found_in_reference) {
+  message("✓ Guide sequence found in oriented reference sequence")
+  
+  # Find the position of the guide in the reference for validation
+  guide_pos <- regexpr(params$guide_sequence, as.character(reference), fixed = TRUE)
+  if(guide_pos[1] != -1) {
+    message("Guide found at position ", guide_pos[1], " in reference sequence")
+  }
+} else {
+  warning("✗ Guide sequence NOT found in oriented reference sequence!")
+  message("This suggests the reference orientation may be incorrect")
+  message("Guide sequence: ", params$guide_sequence)
+  message("Reference sequence: ", substr(as.character(reference), 1, 100), "...")
+}
+
+message("Target strand: ", auto_params$target_strand)
 message("Target width: ", width(target_location))
-message("Reference length: ", nchar(reference_raw))
+message("Reference length: ", nchar(as.character(reference)))
 message("Guide sequence: ", params$guide_sequence)
-message("Reference sequence: ", substr(reference_raw, 1, 50), "...")
 
 # Show final parameters being used
 final_params_df <- data.frame(
@@ -399,7 +409,7 @@ sorted_bam_files <- selected_bam_files
 bam_sample_names <- selected_sample_names
 ```
 
-### Variant plots
+### Variant analysis
 
 This section creates variant plots for the CRISPR editing outcomes. It uses the `CrispRVariants` package to visualize the variants detected in the target region across samples.
 
@@ -429,6 +439,7 @@ if(file.exists(gtf_fname)) {
 }
 ```
 
+
 ```{r variant-plots2}
 #| fig.width: 16
 #| fig.height: 16
@@ -454,19 +465,29 @@ if(!any(group == "control")) {
   warning("No control samples found in selected BAMs!")
 }
 
-plotVariants(crispr_set, txdb = txdb, gene.text.size = 8, main = paste0(params$treatment, " vs ", params$control),
+# Use the main parameter in plotVariants instead of trying to add title with +
+plotVariants(crispr_set, txdb = txdb, gene.text.size = 8,
+    main = paste0("Variant Counts for ", params$guide_name, ": ", params$guide_sequence),
     row.ht.ratio = c(1,8), col.wdth.ratio = c(4,2),
     plotAlignments.args = list(line.weight = 0.5, ins.size = 2, 
                                legend.symbol.size = 4),
     plotFreqHeatmap.args = list(plot.text.size = 3, x.size = 8, group = group, 
                                 legend.text.size = 8, 
-                                legend.key.height = grid::unit(0.5, "lines"))) 
+                                legend.key.height = grid::unit(0.5, "lines")))
 
 # Use parameter-based filename
 pdf(file.path(params$outs_path, paste0(params$treatment, "_vs_", params$control, "_variant_plot.pdf")), 
     width = 16, height = 16)
-plotVariants(crispr_set, main = paste0(params$treatment, " vs ", params$control))
+plotVariants(crispr_set, 
+            main = paste0("Variant Counts for ", params$guide_name, ": ", params$guide_sequence),
+            txdb = txdb, gene.text.size = 8)
 dev.off()
+```
+
+```{r}
+#| fig.width: 8
+#| fig.height: 8
+plotFreqHeatmap(crispr_set, type = "proportions") + labs(title = paste0("Proportions of Variant Frequency for ", params$guide_name, ":", params$guide_sequence))
 ```
 
 ```{r mutation-efficiency}
@@ -537,18 +558,160 @@ if(length(control_samples) > 0) {
 }
 ```
 
-### Consensus sequences
+```{r efficiency-percentages-detailed}
+# Get variant counts first
+variant_counts <- variantCounts(crispr_set)
+
+# Create the barplot with table to get the result object
+bp_result <- barplotAlleleFreqs(variant_counts, include.table = TRUE)
+
+# Percent table matching barplotAlleleFreqs categories from your rownames
+vc <- variantCounts(crispr_set)
+rn <- rownames(vc)
+
+classify_allele <- function(s){
+  s0 <- trimws(s)
+  if (identical(s0, "no variant")) return("no variant")
+  if (grepl("^SNV:", s0)) return("SNV")
+  if (identical(s0, "Other")) return("Other")
+
+  # sum ALL indel lengths from tokens like "...:<len>D" or "...:<len>I"
+  m <- gregexpr(":[0-9]+[DI]", s0, perl = TRUE)
+  tokens <- regmatches(s0, m)[[1]]
+  if (length(tokens) == 0) return("Other")
+  L_total <- sum(as.integer(gsub("^:([0-9]+)[DI]$", "\\1", tokens)), na.rm = TRUE)
+
+  if (L_total == 0) return("Other")
+  if (L_total %% 3 != 0) {
+    if (L_total >= 10) "frameshift indel ≥ 10" else "frameshift indel < 9"
+  } else {
+    if (L_total > 10) "inframe indel > 10" else "inframe indel ≤ 9"
+  }
+}
+
+cats <- vapply(rn, classify_allele, character(1))
+by_cat <- rowsum(as.matrix(vc), group = cats)
+pct_by_cat <- round(sweep(by_cat, 2, colSums(by_cat), "/") * 100, 2)
+
+DT::datatable(as.data.frame(t(pct_by_cat)),
+              caption = "Percent of reads by category (per sample)")
+
+# Extract percentage data (try different possible names)
+percentage_data <- NULL
+for(name in c("percent", "table", "data", "frequencies")) {
+  if(name %in% names(bp_result)) {
+    percentage_data <- bp_result[[name]]
+    message("Found percentage data in component: ", name)
+    break
+  }
+}
+
+if(is.null(percentage_data)) {
+  # Fallback: calculate percentages manually
+  message("Calculating percentages manually from variant counts")
+  total_reads <- colSums(variant_counts)
+  percentage_data <- sweep(variant_counts, 2, total_reads, "/") * 100
+}
+
+# Create a nice summary table
+if(!is.null(percentage_data)) {
+  # Add a summary row for each variant type
+  if(ncol(percentage_data) > 1) {
+    # Calculate mean percentages across samples for each variant
+    summary_stats <- data.frame(
+      Variant = rownames(percentage_data),
+      Mean_Percentage = rowMeans(percentage_data, na.rm = TRUE),
+      SD_Percentage = apply(percentage_data, 1, sd, na.rm = TRUE),
+      Min_Percentage = apply(percentage_data, 1, min, na.rm = TRUE),
+      Max_Percentage = apply(percentage_data, 1, max, na.rm = TRUE),
+      stringsAsFactors = FALSE
+    )
+    
+    DT::datatable(summary_stats, 
+                 caption = "Variant Frequency Summary Statistics",
+                 options = list(pageLength = 10)) %>%
+      DT::formatRound(columns = 2:5, digits = 2)
+  }
+  
+  # Display the full percentage table
+  DT::datatable(percentage_data, 
+               caption = "Allele Frequencies by Sample (%)",
+               options = list(pageLength = 15, scrollX = TRUE)) %>%
+    DT::formatRound(columns = which(sapply(percentage_data, is.numeric)), digits = 2)
+  
+  # Save the data
+  write.csv(percentage_data, 
+           file.path(params$outs_path, paste0(params$treatment, "_vs_", params$control, "_allele_percentages.csv")),
+           row.names = TRUE)
+  
+  if(exists("summary_stats")) {
+    write.csv(summary_stats, 
+             file.path(params$outs_path, paste0(params$treatment, "_vs_", params$control, "_variant_summary.csv")),
+             row.names = FALSE)
+  }
+}
+```
+
+```{r editing-efficiency-summary}
+# Create a focused editing efficiency summary
+variant_counts <- variantCounts(crispr_set)
+
+# Calculate total reads and editing percentages
+editing_summary <- data.frame()
+
+for(sample in colnames(variant_counts)) {
+  total_reads <- sum(variant_counts[, sample])
+  
+  # Assuming first row is "no variant" (reference sequence)
+  reference_reads <- variant_counts[1, sample]
+  edited_reads <- total_reads - reference_reads
+  
+  editing_percentage <- (edited_reads / total_reads) * 100
+  
+  sample_type <- ifelse(grepl(params$treatment, sample), "Treatment", 
+                       ifelse(grepl(params$control, sample), "Control", "Other"))
+  
+  editing_summary <- rbind(editing_summary, data.frame(
+    Sample = sample,
+    Sample_Type = sample_type,
+    Total_Reads = total_reads,
+    Reference_Reads = reference_reads,
+    Edited_Reads = edited_reads,
+    Editing_Percentage = round(editing_percentage, 2),
+    stringsAsFactors = FALSE
+  ))
+}
+
+# Display the editing efficiency summary
+DT::datatable(editing_summary, 
+             caption = "CRISPR Editing Efficiency Summary",
+             options = list(pageLength = 10)) %>%
+  DT::formatStyle("Sample_Type",
+                 backgroundColor = DT::styleEqual(c("Treatment", "Control"), 
+                                                c("lightblue", "lightgreen")))
+
+# Calculate group means
+group_summary <- aggregate(Editing_Percentage ~ Sample_Type, editing_summary, 
+                          function(x) c(Mean = mean(x), SD = sd(x), N = length(x)))
+
+group_summary_df <- data.frame(
+  Group = group_summary$Sample_Type,
+  Mean_Editing_Percentage = round(group_summary$Editing_Percentage[, "Mean"], 2),
+  SD_Editing_Percentage = round(group_summary$Editing_Percentage[, "SD"], 2),
+  Sample_Count = group_summary$Editing_Percentage[, "N"],
+  stringsAsFactors = FALSE
+)
+
+DT::datatable(group_summary_df, caption = "CRISPR Editing Efficiency by Group")
+```
+
 
 ```{r consensus-sequences}
 # Display consensus sequences
 consensus_seqs <- consensusSeqs(crispr_set)
-DT::datatable(as.data.frame(consensus_seqs), 
-             caption = "Consensus Sequences by Sample",
-             options = list(scrollX = TRUE))
-
 # Save consensus sequences
 write.csv(as.data.frame(consensus_seqs), 
-         file.path(params$outs_path, paste0(params$treatment, "_vs_", params$control, "_consensus_sequences.csv")),
+         file.path(params$outs_path, paste0(params$treatment, "_vs_", params$control, "_", params$guide_name, "_consensus_sequences.csv")),
          row.names = TRUE)
 ```
 
